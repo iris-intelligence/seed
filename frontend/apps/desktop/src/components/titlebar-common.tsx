@@ -807,7 +807,8 @@ function getRouteId(route: NavRoute): UnpackedHypermediaId | null {
     route.key === 'all-documents' ||
     route.key === 'profile' ||
     route.key === 'contact' ||
-    route.key === 'site-profile'
+    route.key === 'site-profile' ||
+    route.key === 'site-settings'
   ) {
     return route.id
   }
@@ -832,7 +833,8 @@ function isUrlDisplayableRoute(route: NavRoute): boolean {
     route.key === 'comments' ||
     route.key === 'all-documents' ||
     route.key === 'site-profile' ||
-    route.key === 'site-settings-emails'
+    route.key === 'site-settings-emails' ||
+    route.key === 'site-settings'
   )
 }
 
