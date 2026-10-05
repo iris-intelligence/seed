@@ -2530,10 +2530,13 @@ export function useDeleteAgentTrigger(serverUrl: string | undefined, accountUid:
  * back: the socket does not repeat itself, and the streamed text of an answer is cleared the moment
  * its durable event arrives. So events the snapshot is too old to hold are kept behind it.
  * Optimistic rows are not: the snapshot holds their durable form, or their send is still out and
- * its echo arrives over the socket.
+ * its echo arrives over the socket. The session itself (status, title, plan) follows the same
+ * rule: a copy the socket delivered after the snapshot was taken is the one to keep.
  */
-export function mergeFetchedAgentSession<Fetched extends {events: SessionEvent[]}>(
-  cached: {events?: SessionEvent[]} | null | undefined,
+export function mergeFetchedAgentSession<
+  Fetched extends {events: SessionEvent[]; session?: Pick<SessionInfo, 'updatedAt'>},
+>(
+  cached: {events?: SessionEvent[]; session?: Pick<SessionInfo, 'updatedAt'>} | null | undefined,
   fetched: Fetched,
 ): Fetched {
   const newestFetched = fetched.events.at(-1)?.seq ?? 0
@@ -2541,7 +2544,16 @@ export function mergeFetchedAgentSession<Fetched extends {events: SessionEvent[]
   const arrivedSince = (cached?.events ?? []).filter(
     (event) => event.seq !== Number.MAX_SAFE_INTEGER && event.seq > newestFetched && !fetchedIds.has(event.id),
   )
-  return arrivedSince.length > 0 ? {...fetched, events: [...fetched.events, ...arrivedSince]} : fetched
+  const newerSession =
+    cached?.session && fetched.session && cached.session.updatedAt > fetched.session.updatedAt
+      ? cached.session
+      : undefined
+  if (arrivedSince.length === 0 && !newerSession) return fetched
+  return {
+    ...fetched,
+    ...(newerSession ? {session: newerSession} : {}),
+    events: arrivedSince.length > 0 ? [...fetched.events, ...arrivedSince] : fetched.events,
+  }
 }
 
 /** Loads one agent session and durable events from the configured server. */
@@ -2558,7 +2570,7 @@ export function useAgentSession(
       const res = await sendAgentAction({serverUrl, accountUid, action: {_: 'GetSession', sessionId}})
       if (res._ !== 'GetSessionResponse') throw new Error('Unexpected GetSession response')
       // Read the cache now, after the round trip: it holds what the socket appended meanwhile.
-      return mergeFetchedAgentSession(getQueryClient().getQueryData<{events?: SessionEvent[]}>(queryKey), res)
+      return mergeFetchedAgentSession(getQueryClient().getQueryData<typeof res>(queryKey), res)
     },
     enabled: !!serverUrl && !!accountUid && !!sessionId,
     retry: false,

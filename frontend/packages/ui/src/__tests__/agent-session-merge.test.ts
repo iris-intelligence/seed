@@ -51,6 +51,15 @@ describe('mergeFetchedAgentSession', () => {
     expect(mergeFetchedAgentSession(cached, fetched).events.map((entry) => entry.id)).toEqual(['e1', 'e2'])
   })
 
+  test('a session copy the socket delivered after the snapshot was taken is kept', () => {
+    // The turn ended while the fetch was in flight: the socket already said so.
+    const cached = {session: {updatedAt: 20, status: 'idle'}, events: [event(1)]}
+    const fetched = {session: {updatedAt: 10, status: 'streaming'}, events: [event(1)]}
+
+    expect(mergeFetchedAgentSession(cached, fetched).session).toEqual({updatedAt: 20, status: 'idle'})
+    expect(mergeFetchedAgentSession(fetched, cached)).toBe(cached)
+  })
+
   test('nothing cached leaves the fetched session as it is', () => {
     const fetched = {events: [event(1)]}
 
