@@ -3192,6 +3192,11 @@ export class Service {
       for (const sessionId of sessionIds) {
         stmt(this.#db, `DELETE FROM session_events WHERE session_id = ?`).run([sessionId])
       }
+      // Continuations stay inside one agent, so they all go with it.
+      stmt(this.#db, `DELETE FROM session_continuations WHERE account_id = ? AND agent_id = ?`).run([
+        accountId,
+        agentId,
+      ])
       // Run history survives agent deletion detached; FK columns must be cleared before the
       // referenced rows go (runs.agent_id/session_id/trigger_firing_id are enforced FKs).
       stmt(
@@ -3873,12 +3878,26 @@ export class Service {
     for (const liveRun of runs.listLiveSessionRuns(this.#db, accountId, sessionId)) {
       this.#runQueue.cancelTree(accountId, liveRun.id)
     }
+    const linkedByContinuation = stmt<{other: string}, [string]>(
+      this.#db,
+      `SELECT successor_session_id AS other FROM session_continuations WHERE predecessor_session_id = ?1
+         UNION SELECT predecessor_session_id FROM session_continuations WHERE successor_session_id = ?1`,
+    )
+      .all(sessionId)
+      .map((row) => row.other)
     const transaction = this.#db.transaction(() => {
       stmt(this.#db, `UPDATE trigger_firings SET session_id = NULL WHERE account_id = ? AND session_id = ?`).run([
         accountId,
         sessionId,
       ])
       stmt(this.#db, `DELETE FROM session_events WHERE session_id = ?`).run([sessionId])
+      // A continuation is a link between two sessions and has nothing to say once either is gone.
+      // The session at the other end stays, without the link.
+      for (const other of linkedByContinuation) this.#forgetSessionDerived(accountId, other)
+      stmt(
+        this.#db,
+        `DELETE FROM session_continuations WHERE predecessor_session_id = ?1 OR successor_session_id = ?1`,
+      ).run([sessionId])
       // Run history survives session deletion detached; children promote to top level.
       stmt(this.#db, `UPDATE runs SET session_id = NULL WHERE session_id = ?`).run([sessionId])
       stmt(this.#db, `UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?`).run([sessionId])
@@ -8746,6 +8765,48 @@ export class Service {
     beforeSeq?: number,
     limit?: number,
   ): Promise<api.GetSessionResponse> {
+    const owner = stmt<{agent_id: string}, [string, string]>(
+      this.#db,
+      `SELECT agent_id FROM sessions WHERE account_id = ? AND id = ?`,
+    ).get(accountId, sessionId)
+    if (!owner) throw new APIError(404, 'Session not found')
+    const agent = stmt<{definition_cbor: Uint8Array; state_dir: string}, [string, string]>(
+      this.#db,
+      `SELECT definition_cbor, state_dir FROM agents WHERE account_id = ? AND id = ?`,
+    ).get(accountId, owner.agent_id)
+    if (!agent) throw new APIError(404, 'Agent not found')
+    // The prompt first, the log last: resolving the prompt can wait on the network, and events
+    // written during that wait must be in the response. A client that has this session open adds
+    // what its socket delivers to what it fetched; an event that is in neither would be lost to it.
+    const definition = normalizeDefinition(cbor.decode<api.AgentDefinition>(agent.definition_cbor))
+    // What the agent is told, as a person would want to read it: the prompt, then the Space index
+    // the model gets with each turn's input.
+    const systemPromptMarkdown = `${await this.#agentSystemPrompt(
+      accountId,
+      owner.agent_id,
+      definition,
+    )}\n\n${buildSpaceIndex({
+      db: this.#db,
+      accountId,
+      agentId: owner.agent_id,
+      stateDir: agent.state_dir,
+      callableTools: enabledCallableTools(definition, (await this.#codeExec.availability()).available),
+    })}`
+    return {...this.#readSession(accountId, sessionId, afterSeq, beforeSeq, limit), systemPromptMarkdown}
+  }
+
+  /**
+   * A session and its events as they are stored right now, without the system prompt. Synchronous,
+   * so a caller can pair the read with something else in the same step: a subscription that starts
+   * in the step its replay is read in can neither miss an event nor see one twice.
+   */
+  #readSession(
+    accountId: string,
+    sessionId: string,
+    afterSeq?: number,
+    beforeSeq?: number,
+    limit?: number,
+  ): Omit<api.GetSessionResponse, 'systemPromptMarkdown'> {
     if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
       throw new APIError(400, 'afterSeq must be a non-negative integer')
     }
@@ -8799,15 +8860,6 @@ export class Service {
         this.#sessionContinuationLinks(accountId, sessionId),
       ),
       events,
-      // What the agent is told, as a person would want to read it: the prompt, then the Space
-      // index the model gets with each turn's input.
-      systemPromptMarkdown: `${await this.#agentSystemPrompt(accountId, agent.id, definition)}\n\n${buildSpaceIndex({
-        db: this.#db,
-        accountId,
-        agentId: agent.id,
-        stateDir: agent.state_dir,
-        callableTools: enabledCallableTools(definition, (await this.#codeExec.availability()).available),
-      })}`,
       ...(triggerContext ? {triggerContext} : {}),
       ...(hasMoreBefore ? {hasMoreBefore} : {}),
       contextWindow: this.#sessionContextWindow(accountId, definition, sessionRowToInfo(session)),
@@ -8983,7 +9035,11 @@ export class Service {
      * this to forward the owner's events for the key to the public reader.
      */
     publicReadOf?: string
-    replay?: api.GetSessionResponse
+    /**
+     * Reads the session and the events past the subscriber's `afterSeq`. The socket layer calls
+     * it in the same step that starts the subscription, so no event falls between the two.
+     */
+    replay?: () => Pick<api.GetSessionResponse, 'session' | 'events'>
     /** Snapshot + durable journal replay for `runs/<rootRunId>` subscriptions. */
     runsReplay?: {runs: api.RunInfo[]; entries: api.RunJournalEntryInfo[]}
   }> {
@@ -9004,9 +9060,16 @@ export class Service {
       const sessionId = sessionMatch[1]
       if (!sessionId) throw new APIError(400, 'Subscription key is invalid')
       const ownerAccountId = this.#actionAccountId(verified.accountId, {_: 'GetSession', sessionId})
-      const replay = await this.#getSession(ownerAccountId, sessionId, envelope.action.afterSeq)
-      const access = this.#requireAgentAccess(verified.accountId, replay.session.agentId, 'reader')
-      return {accountId: verified.accountId, key, replay, ...publicReadOf(access)}
+      const session = this.#getSessionInfo(ownerAccountId, sessionId)
+      if (!session) throw new APIError(404, 'Session not found')
+      const access = this.#requireAgentAccess(verified.accountId, session.agentId, 'reader')
+      const afterSeq = envelope.action.afterSeq
+      return {
+        accountId: verified.accountId,
+        key,
+        replay: () => this.#readSession(ownerAccountId, sessionId, afterSeq),
+        ...publicReadOf(access),
+      }
     }
     const runMatch = /^runs\/([^/]+)$/.exec(key)
     if (runMatch) {
@@ -9349,22 +9412,41 @@ export class Service {
       if (!occurrence) continue
       matched += 1
       const firingId = crypto.randomUUID()
-      const inserted = stmt(
-        this.#db,
-        `INSERT OR IGNORE INTO trigger_firings
-           (id, account_id, agent_id, trigger_id, activity_key, activity_cbor, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run([
-        firingId,
-        trigger.account,
-        trigger.agentId,
-        trigger.id,
-        occurrence.activityKey,
-        cbor.encode(occurrence.activity),
-        'created',
-        now,
-      ])
-      if (inserted.changes === 0) {
+      // The firing and the schedule's advance are one write. An occurrence that has a firing is
+      // spent, whatever comes of it: it woke a run, found nobody listening, or failed. Were the
+      // schedule left where it was in the last two cases, every later poll would compute this same
+      // occurrence, find its firing already recorded, and skip it. The schedule would never fire
+      // again. A 'once' schedule is disabled here for the same reason, and so that a slow run
+      // cannot let its one occurrence fire twice.
+      const once = trigger.source.schedule.kind === 'once'
+      const claimed = this.#db.transaction((): boolean => {
+        const inserted = stmt(
+          this.#db,
+          `INSERT OR IGNORE INTO trigger_firings
+             (id, account_id, agent_id, trigger_id, activity_key, activity_cbor, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run([
+          firingId,
+          trigger.account,
+          trigger.agentId,
+          trigger.id,
+          occurrence.activityKey,
+          cbor.encode(occurrence.activity),
+          'created',
+          now,
+        ])
+        if (inserted.changes === 0) return false
+        stmt(
+          this.#db,
+          `UPDATE agent_triggers SET last_fired_at = ?, last_error = NULL, enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
+        ).run(
+          // The caller's clock, not Date.now(): mixing the injected timestamp with the wall clock
+          // makes a firing in the same millisecond as trigger creation eligible to re-match.
+          [Math.max(now, occurrence.scheduledAt), once ? 1 : 0, trigger.account, trigger.id],
+        )
+        return true
+      })()
+      if (!claimed) {
         skipped += 1
         continue
       }
@@ -9391,21 +9473,6 @@ export class Service {
           ])
           this.#forgetSessionDerived(trigger.account, session.sessionId)
         }
-        // Disable a 'once' schedule at fire time (session created), not after the run, so a slow run
-        // can't let the same occurrence fire twice.
-        stmt(
-          this.#db,
-          `UPDATE agent_triggers SET last_fired_at = ?, last_error = NULL, enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
-        ).run(
-          // The caller's clock, not Date.now(): mixing the injected timestamp with the wall clock
-          // makes a firing in the same millisecond as trigger creation eligible to re-match.
-          [
-            Math.max(now, occurrence.scheduledAt),
-            trigger.source.schedule.kind === 'once' ? 1 : 0,
-            trigger.account,
-            trigger.id,
-          ],
-        )
         fired += 1
         // Run the agent in the background; the session already exists for this occurrence.
         if (session) {
