@@ -31,6 +31,7 @@ import {
   type RunJournalEntryInfo,
   type RunStatus,
   type SessionAttachmentInfo,
+  type SessionEvent,
   type SessionInfo,
   type SessionListCursor,
   type SessionModelOverride,
@@ -2520,19 +2521,44 @@ export function useDeleteAgentTrigger(serverUrl: string | undefined, accountUid:
   })
 }
 
+/**
+ * A fetched session, brought up to date with what the socket delivered while the fetch was in flight.
+ *
+ * A fetch is a snapshot of the log from when the server read it. An open transcript also receives
+ * every new event over its socket, straight into the same cache entry. Putting the snapshot over
+ * that entry as it is would take back whatever arrived in between, and nothing would bring it
+ * back: the socket does not repeat itself, and the streamed text of an answer is cleared the moment
+ * its durable event arrives. So events the snapshot is too old to hold are kept behind it.
+ * Optimistic rows are not: the snapshot holds their durable form, or their send is still out and
+ * its echo arrives over the socket.
+ */
+export function mergeFetchedAgentSession<Fetched extends {events: SessionEvent[]}>(
+  cached: {events?: SessionEvent[]} | null | undefined,
+  fetched: Fetched,
+): Fetched {
+  const newestFetched = fetched.events.at(-1)?.seq ?? 0
+  const fetchedIds = new Set(fetched.events.map((event) => event.id))
+  const arrivedSince = (cached?.events ?? []).filter(
+    (event) => event.seq !== Number.MAX_SAFE_INTEGER && event.seq > newestFetched && !fetchedIds.has(event.id),
+  )
+  return arrivedSince.length > 0 ? {...fetched, events: [...fetched.events, ...arrivedSince]} : fetched
+}
+
 /** Loads one agent session and durable events from the configured server. */
 export function useAgentSession(
   serverUrl: string | undefined,
   accountUid: string | null | undefined,
   sessionId: string | undefined,
 ) {
+  const queryKey = ['agents', 'session', serverUrl, accountUid, sessionId]
   return useQuery({
-    queryKey: ['agents', 'session', serverUrl, accountUid, sessionId],
+    queryKey,
     queryFn: async () => {
       if (!serverUrl || !accountUid || !sessionId) return null
       const res = await sendAgentAction({serverUrl, accountUid, action: {_: 'GetSession', sessionId}})
       if (res._ !== 'GetSessionResponse') throw new Error('Unexpected GetSession response')
-      return res
+      // Read the cache now, after the round trip: it holds what the socket appended meanwhile.
+      return mergeFetchedAgentSession(getQueryClient().getQueryData<{events?: SessionEvent[]}>(queryKey), res)
     },
     enabled: !!serverUrl && !!accountUid && !!sessionId,
     retry: false,
@@ -3429,11 +3455,20 @@ export function useAgentWebSocketSubscription(
         })
       }
       const sessionId = event.event.sessionId
+      let missedEvents = false
       getQueryClient().setQueriesData(
         {queryKey: ['agents', 'session', serverUrl, accountUid, sessionId]},
         (old: any) => {
           if (!old || old._ !== 'GetSessionResponse') return old
           if (old.events.some((existing: any) => existing.id === event.event.id)) return old
+          // Sequence numbers have no holes, so one that skips ahead means events never reached this
+          // socket (it was slow, or they were written while its subscription was being set up).
+          const newestSeq = old.events.reduce(
+            (newest: number, existing: any) =>
+              existing.seq === Number.MAX_SAFE_INTEGER ? newest : Math.max(newest, existing.seq),
+            0,
+          )
+          if (newestSeq > 0 && event.event.seq > newestSeq + 1) missedEvents = true
           const events = old.events.filter((existing: any) => {
             if (typeof existing.id !== 'string' || !existing.id.startsWith('optimistic-')) return true
             // Only a message the USER wrote can be the echo of a message the user is waiting on. The
@@ -3443,6 +3478,11 @@ export function useAgentWebSocketSubscription(
           return {...old, events: [...events, event.event]}
         },
       )
+      if (missedEvents) {
+        // Fetch what is missing. The fetch keeps this event and any that follow it.
+        log('append skipped ahead; refetching session', {sessionId, seq: event.event.seq})
+        invalidateQueries(['agents', 'session', serverUrl, accountUid, sessionId])
+      }
       // No agent-detail invalidation here: GetAgent returns the agent with every one of its
       // sessions (two lookups per row on the server), and nothing in a transcript event changes
       // the agent. The account hints refresh agent detail for the reasons that do.
