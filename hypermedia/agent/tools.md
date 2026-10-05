@@ -61,9 +61,9 @@ The agent always knows what it _could_ expand, without paying for every contract
 
 `call` never punishes a miss. Calling an unknown tool returns the `~/tools` listing. Calling a known tool with input its schema rejects returns **the tool's contract** as the result, plus the validation errors, so the retry succeeds (`executeCallVerb`, `api-service.ts:7794`). <!-- id:edRIqz0f -->
 
-Once a tool's contract has entered the transcript, through an agent `read` of `~/tools/<name>` or any `call` by that name, the tool is **promoted** to a real provider tool for the rest of the thread. See [promotion](./promotion.md). Promotion is derived only from durable `tool_call` events (`expandedCallablesFromEvents()`, `api-service.ts:7221`), so resume, park, restart, and compaction all rebuild the same set. Events with actor `user` are skipped: a user's palette call must not silently reshape the agent's active toolset. <!-- id:3AAxXIeD -->
+Once a tool's contract has entered the transcript, through an agent `read` of `~/tools/<name>` or any `call` by that name, the tool is **promoted** to a real provider tool for the rest of the thread. See [promotion](./promotion.md). Promotion is derived only from durable `tool_call` events (`expandedCallablesFromEvents()`, `api-service.ts:7221`), so resume, park, and restart all rebuild the same set. Events with actor `user` are skipped: a user's palette call must not silently reshape the agent's active toolset. <!-- id:3AAxXIeD -->
 
-Before anything reaches Pi (`#runPiAgent`), promotion is intersected with the agent's enabled callables plus its own enabled non-builtin documents (authored lambdas and MCP projections, re-derived from the definition at run start): <!-- id:D8DK4IAm -->
+Before anything is offered to the provider (`#runPiAgent`), promotion is intersected with the agent's enabled callables plus its own enabled non-builtin documents (authored lambdas and MCP projections, re-derived from the definition at run start): <!-- id:D8DK4IAm -->
 
 ```ts <!-- id:4ZQwDiQa -->
 const expandedCallables = this.#expandedCallablesForSession(sessionId)
@@ -71,7 +71,7 @@ const expandedCallables = this.#expandedCallablesForSession(sessionId)
   .filter((name) => enabledCallables.includes(name) || documentTools.has(name))
 ```
 
-This filter is a security control. A hallucinated `call {tool: 'bash'}` durably stores that name. An unfiltered allowlist would hand `bash` to Pi and activate Pi's own host builtins outside the sandbox. A promoted document tool is defined from its own document (`toolMetadataFromDocument`): the contract the model read is the schema the provider now validates against, and its executor is the same `call` dispatch. <!-- id:cuCkX0YE -->
+This filter is a security control. A hallucinated `call {tool: 'bash'}` durably stores that name, and only names that pass this filter are ever installed as tools of the turn. Nothing else can run: the turn's harness holds Seed's verbs and no host tools. A promoted document tool is defined from its own document (`toolMetadataFromDocument`): the contract the model read is the schema the provider now validates against, and its executor is the same `call` dispatch. <!-- id:cuCkX0YE -->
 
 # Grants <!-- id:tPg5Z6sN -->
 
@@ -304,7 +304,7 @@ When a run uses its last slot, `childrenExhaustedMessage()` tells it to finish a
 
 Maintains the thread's visible checklist: `{title?, steps: [{id, label, status: pending | running | done | failed | skipped}]}`. Each call replaces the whole plan. The plan is stored on `sessions.plan_cbor` and writes **no transcript event**, because the checklist is a card and not part of the conversation. The server stamps the owning run id. When every [step](./step.md) settles, it copies that snapshot onto the run, so the completed plan stays in transcript history even after a later turn replaces the session's mutable plan. The [plan](./plan.md) term page has the short version. <!-- id:rWxol_cq -->
 
-The runtime handles one consequence of this directly. A model resuming after its children finished cannot see the list it published. So `planStateBlock()` (`api-service.ts:414`) rebuilds a `<plan_state>` block from session state on **every turn** and injects it into the replay as the last user message. It is never stored. The transcript keeps exactly one copy of the truth, and the log records what happened, never what the runtime reminded the model about. Step ids and labels are model-authored text handed back inside a frame whose syntax the model knows, so both go through `escapeActionFraming()`. <!-- id:6gIaYQei -->
+The runtime handles one consequence of this directly. A model resuming after its children finished cannot see the list it published. So `planStateBlock()` (`api-service.ts:414`) rebuilds a `<plan_state>` block from session state on **every turn** and sends it behind the turn's input with every request of that turn. It is never stored. The transcript keeps exactly one copy of the truth, and the log records what happened, never what the runtime reminded the model about. Step ids and labels are model-authored text handed back inside a frame whose syntax the model knows, so both go through `escapeActionFraming()`. <!-- id:6gIaYQei -->
 
 **Runtime settlement.** When every run attached to a running step comes back `succeeded`, `#settlePlanStepFromChildren()` (`api-service.ts:2727`) marks the step `done` with `resolvedBy: 'runtime'`. Only success settles a step. What a failed child means is a judgment the model makes, and the continuation loop exists to make it ask. Model input can never forge `resolvedBy`. `normalizeRunPlan` reads only what the model may say, and `#carryResolvedBy()` (`api-service.ts:2174`) carries the runtime's mark across later writes while the step stays done. It drops the mark if the step is reopened or written off. <!-- id:mCLG-mEC -->
 
@@ -351,15 +351,15 @@ Tool failures should usually become `tool_result.error`, so the model can respon
 # Tool lifecycle <!-- id:96sl4tD5 -->
 
 <!-- id:T5dSr29_ -->
-1. The server registers the verbs (plus any promoted callables) with Pi, with `noTools: 'builtin'` so Pi's own host tools never load. <!-- id:xsFatZeE -->
-2. Pi calls the model. The model returns assistant text and tool calls. <!-- id:yQNautgz -->
-3. Pi emits `message_end` before tool execution. The server appends the turn's assistant text as a durable `message` event with its `meta`. <!-- id:mUpcgNp_ -->
-4. The server appends a durable `tool_call` event, executes the Seed-owned implementation, and appends `tool_result`. <!-- id:TjGqsaDS -->
-5. The model continues until final assistant text. Each later assistant turn is appended at its own `message_end`. <!-- id:SsXCJthS -->
+1. The server installs the verbs (plus any promoted callables) as the only tools of the turn's [Pi Durable](./durable-sessions.md) harness. <!-- id:xsFatZeE -->
+2. The harness calls the model. The model returns assistant text and tool calls. <!-- id:yQNautgz -->
+3. The harness commits the response as one entry before any tool runs. The server projects it into the log: the assistant text as a durable `message` event with its `meta`, then one `tool_call` event per call. <!-- id:mUpcgNp_ -->
+4. Each call runs as its own checkpointed task that executes the Seed-owned implementation. Its committed result is projected as `tool_result`. <!-- id:TjGqsaDS -->
+5. The model continues until final assistant text. Each later response is projected the same way when its entry is committed. <!-- id:SsXCJthS -->
 
-On later turns the server rebuilds durable assistant text and consecutive `tool_call` events as a single Pi assistant message, placed before their matching `tool_result` messages. This keeps provider replay valid for APIs such as OpenAI chat completions, which reject orphaned `tool` messages and expect multi-tool batches grouped. <!-- id:TyneiaQU -->
+On later turns the model reads those same entries from the session's durable conversation. When the conversation has to be rebuilt from the log, the server replays assistant text and consecutive `tool_call` events as a single assistant message, placed before their matching `tool_result` messages. This keeps provider replay valid for APIs such as OpenAI chat completions, which reject orphaned `tool` messages and expect multi-tool batches grouped. <!-- id:TyneiaQU -->
 
-Parked `delegate` calls keep their durable `tool_call` unanswered on purpose, until the child's finalizer appends the real result. A post-park reconcile pass closes the race where a fast child finalizes before the parent's `waiting` status commits. <!-- id:9Dtuf-4o -->
+Parked `delegate` calls keep their durable `tool_call` unanswered on purpose, until the child's finalizer appends the real result. In the durable conversation the call holds a placeholder result until then. A post-park reconcile pass closes the race where a fast child finalizes before the parent's `waiting` status commits. <!-- id:9Dtuf-4o -->
 
 # Size limits <!-- id:TX-32IwL -->
 
