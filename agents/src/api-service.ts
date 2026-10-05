@@ -3168,6 +3168,11 @@ export class Service {
       for (const sessionId of sessionIds) {
         stmt(this.#db, `DELETE FROM session_events WHERE session_id = ?`).run([sessionId])
       }
+      // Continuations stay inside one agent, so they all go with it.
+      stmt(this.#db, `DELETE FROM session_continuations WHERE account_id = ? AND agent_id = ?`).run([
+        accountId,
+        agentId,
+      ])
       // Run history survives agent deletion detached; FK columns must be cleared before the
       // referenced rows go (runs.agent_id/session_id/trigger_firing_id are enforced FKs).
       stmt(
@@ -3849,12 +3854,26 @@ export class Service {
     for (const liveRun of runs.listLiveSessionRuns(this.#db, accountId, sessionId)) {
       this.#runQueue.cancelTree(accountId, liveRun.id)
     }
+    const linkedByContinuation = stmt<{other: string}, [string]>(
+      this.#db,
+      `SELECT successor_session_id AS other FROM session_continuations WHERE predecessor_session_id = ?1
+         UNION SELECT predecessor_session_id FROM session_continuations WHERE successor_session_id = ?1`,
+    )
+      .all(sessionId)
+      .map((row) => row.other)
     const transaction = this.#db.transaction(() => {
       stmt(this.#db, `UPDATE trigger_firings SET session_id = NULL WHERE account_id = ? AND session_id = ?`).run([
         accountId,
         sessionId,
       ])
       stmt(this.#db, `DELETE FROM session_events WHERE session_id = ?`).run([sessionId])
+      // A continuation is a link between two sessions and has nothing to say once either is gone.
+      // The session at the other end stays, without the link.
+      for (const other of linkedByContinuation) this.#forgetSessionDerived(accountId, other)
+      stmt(
+        this.#db,
+        `DELETE FROM session_continuations WHERE predecessor_session_id = ?1 OR successor_session_id = ?1`,
+      ).run([sessionId])
       // Run history survives session deletion detached; children promote to top level.
       stmt(this.#db, `UPDATE runs SET session_id = NULL WHERE session_id = ?`).run([sessionId])
       stmt(this.#db, `UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?`).run([sessionId])
