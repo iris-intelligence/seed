@@ -9435,16 +9435,25 @@ export class Service {
           'created',
           now,
         ])
-        if (inserted.changes === 0) return false
+        // A firing that is already there belongs to a schedule that was left behind before this
+        // write was atomic. Advancing it now, without firing again, lets it resume at the next
+        // occurrence. Whatever error that firing recorded stays.
         stmt(
           this.#db,
-          `UPDATE agent_triggers SET last_fired_at = ?, last_error = NULL, enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
+          `UPDATE agent_triggers SET last_fired_at = ?, last_error = CASE WHEN ? THEN NULL ELSE last_error END,
+             enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
         ).run(
           // The caller's clock, not Date.now(): mixing the injected timestamp with the wall clock
           // makes a firing in the same millisecond as trigger creation eligible to re-match.
-          [Math.max(now, occurrence.scheduledAt), once ? 1 : 0, trigger.account, trigger.id],
+          [
+            Math.max(now, occurrence.scheduledAt),
+            inserted.changes > 0 ? 1 : 0,
+            once ? 1 : 0,
+            trigger.account,
+            trigger.id,
+          ],
         )
-        return true
+        return inserted.changes > 0
       })()
       if (!claimed) {
         skipped += 1
