@@ -8131,7 +8131,8 @@ export class Service {
       run
         ? runs
             .listLiveSessionRuns(this.#db, run.accountId, sessionId)
-            .filter((other) => other.id !== run.id)
+            // A parked run is not waiting its turn: the model took its message in before it parked.
+            .filter((other) => other.id !== run.id && other.status !== 'waiting')
             .flatMap((other) =>
               isRecord(other.input) && Array.isArray(other.input.userEventIds) ? other.input.userEventIds : [],
             )
@@ -8208,15 +8209,14 @@ export class Service {
     } else if (
       submitted?.type === 'input' &&
       submitted.status === 'done' &&
-      recorded !== undefined &&
-      ((recorded.eventId !== undefined && runEventIds.has(recorded.eventId)) ||
-        (run !== undefined && recorded.requestId.startsWith(`run:${run.id}:`))) &&
       appended.length === 0 &&
       late.length === 0 &&
       (appendable || sync.importedSeq === 0)
     ) {
-      // Nothing new, and the newest input the conversation answered is this run's own: its message,
-      // or what a later pass of it submitted (an open obligation, the results of its children).
+      // Nothing has reached the log since the newest input the conversation answered, so there is
+      // nothing to ask the model. That input was this run's own (it was restarted between its
+      // answer and its own bookkeeping), or another run's that took in what this one came for: a
+      // message that arrived just before it, or the results of the children it was parked on.
       return {answered: submitted}
     }
 
