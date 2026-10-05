@@ -8374,6 +8374,40 @@ export class Service {
     beforeSeq?: number,
     limit?: number,
   ): Promise<api.GetSessionResponse> {
+    const owner = stmt<{agent_id: string}, [string, string]>(
+      this.#db,
+      `SELECT agent_id FROM sessions WHERE account_id = ? AND id = ?`,
+    ).get(accountId, sessionId)
+    if (!owner) throw new APIError(404, 'Session not found')
+    const agent = stmt<{definition_cbor: Uint8Array; state_dir: string}, [string, string]>(
+      this.#db,
+      `SELECT definition_cbor, state_dir FROM agents WHERE account_id = ? AND id = ?`,
+    ).get(accountId, owner.agent_id)
+    if (!agent) throw new APIError(404, 'Agent not found')
+    // The prompt first, the log last: resolving the prompt can wait on the network, and events
+    // written during that wait must be in the response. A client that has this session open adds
+    // what its socket delivers to what it fetched; an event that is in neither would be lost to it.
+    const systemPromptMarkdown = await this.#agentSystemPrompt(
+      accountId,
+      owner.agent_id,
+      normalizeDefinition(cbor.decode<api.AgentDefinition>(agent.definition_cbor)),
+      agent.state_dir,
+    )
+    return {...this.#readSession(accountId, sessionId, afterSeq, beforeSeq, limit), systemPromptMarkdown}
+  }
+
+  /**
+   * A session and its events as they are stored right now, without the system prompt. Synchronous,
+   * so a caller can pair the read with something else in the same step: a subscription that starts
+   * in the step its replay is read in can neither miss an event nor see one twice.
+   */
+  #readSession(
+    accountId: string,
+    sessionId: string,
+    afterSeq?: number,
+    beforeSeq?: number,
+    limit?: number,
+  ): Omit<api.GetSessionResponse, 'systemPromptMarkdown'> {
     if (afterSeq !== undefined && (!Number.isInteger(afterSeq) || afterSeq < 0)) {
       throw new APIError(400, 'afterSeq must be a non-negative integer')
     }
@@ -8427,7 +8461,6 @@ export class Service {
         this.#sessionContinuationLinks(accountId, sessionId),
       ),
       events,
-      systemPromptMarkdown: await this.#agentSystemPrompt(accountId, agent.id, definition, agent.state_dir),
       ...(triggerContext ? {triggerContext} : {}),
       ...(hasMoreBefore ? {hasMoreBefore} : {}),
       contextWindow: this.#sessionContextWindow(accountId, definition, sessionRowToInfo(session)),
@@ -8603,7 +8636,11 @@ export class Service {
      * this to forward the owner's events for the key to the public reader.
      */
     publicReadOf?: string
-    replay?: api.GetSessionResponse
+    /**
+     * Reads the session and the events past the subscriber's `afterSeq`. The socket layer calls
+     * it in the same step that starts the subscription, so no event falls between the two.
+     */
+    replay?: () => Pick<api.GetSessionResponse, 'session' | 'events'>
     /** Snapshot + durable journal replay for `runs/<rootRunId>` subscriptions. */
     runsReplay?: {runs: api.RunInfo[]; entries: api.RunJournalEntryInfo[]}
   }> {
@@ -8624,9 +8661,16 @@ export class Service {
       const sessionId = sessionMatch[1]
       if (!sessionId) throw new APIError(400, 'Subscription key is invalid')
       const ownerAccountId = this.#actionAccountId(verified.accountId, {_: 'GetSession', sessionId})
-      const replay = await this.#getSession(ownerAccountId, sessionId, envelope.action.afterSeq)
-      const access = this.#requireAgentAccess(verified.accountId, replay.session.agentId, 'reader')
-      return {accountId: verified.accountId, key, replay, ...publicReadOf(access)}
+      const session = this.#getSessionInfo(ownerAccountId, sessionId)
+      if (!session) throw new APIError(404, 'Session not found')
+      const access = this.#requireAgentAccess(verified.accountId, session.agentId, 'reader')
+      const afterSeq = envelope.action.afterSeq
+      return {
+        accountId: verified.accountId,
+        key,
+        replay: () => this.#readSession(ownerAccountId, sessionId, afterSeq),
+        ...publicReadOf(access),
+      }
     }
     const runMatch = /^runs\/([^/]+)$/.exec(key)
     if (runMatch) {
