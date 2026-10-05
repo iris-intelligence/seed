@@ -154,10 +154,10 @@ Every request logs `{sessionId, agentId, provider, model, reasoningLevel, active
 # Message context <!-- id:4bmgIq8a -->
 
 The provider receives, in order: <!-- id:HJOieZI9 -->
-  1. the assembled system prompt (agent definition + shared instructions + memory + user-actions + [Space index](./space-index.md) + signing identities). It carries no clock, so it does not change from turn to turn; <!-- id:cHiwa70H -->
+  1. the assembled system prompt (agent definition + shared instructions + memory + user-actions + signing identities). It carries no clock, no [Space index](./space-index.md) and no running counts, so it does not change from turn to turn; <!-- id:cHiwa70H -->
   2. the session's durable conversation: user messages, with user-[actor](./actor.md) tool events as `<user_action>` blocks, and every earlier provider response and tool result exactly as it was recorded; <!-- id:xCwoy-jM -->
   3. this turn's input: the newest user message, or `<background_work_update>` when a [park](./park.md)-resume has no new message to answer; <!-- id:eR2-2Cj4 -->
-  4. per-turn state behind the input, never stored: the `<plan_state>` checklist, `<context_usage>`, `<session_status>`, and `<current_time>`. <!-- id:nmrtuP4i -->
+  4. per-turn state behind the input, never stored: the `<space>` index, `<delegation_budget>`, the `<plan_state>` checklist, `<context_usage>`, `<session_status>`, and `<current_time>`. <!-- id:nmrtuP4i -->
 
 When the conversation has to be rebuilt from the log, tool events are replayed as paired assistant tool-call and tool-result messages, so the provider never sees an orphaned tool result. [Durable sessions](./durable-sessions.md) explains when that happens. <!-- id:8dI8vdJp -->
 

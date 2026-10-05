@@ -43,7 +43,7 @@ Agents service (Bun)
   ├─ AES-GCM secret storage
   ├─ Pi Durable model execution loop, one durable conversation per session
   ├─ the verbs (read / write / call / delegate / plan, plus status / continue_session)
-  ├─ tool documents in ~/tools + the <space> index in every system prompt
+  ├─ tool documents in ~/tools + the <space> index with every turn's input
   ├─ run queue: leases, boot sweep, park/resume, wake sources
   ├─ QuickJS script engine with a content-keyed journal
   └─ diagnostic logging

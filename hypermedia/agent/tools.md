@@ -48,7 +48,7 @@ type ToolDocument = {
 
 # The Space index <!-- id:OmLIl6Dh -->
 
-Every system prompt carries a compact `<space>` block built by `buildSpaceIndex()`. It has: <!-- id:hv-y1xqA -->
+Every turn's input is followed by a compact `<space>` block built by `buildSpaceIndex()`. It has: <!-- id:hv-y1xqA -->
   - one line per enabled tool document (`- name — summary`). Authored tools are tagged `(authored)` and remote tools `(<server> MCP)`. An MCP server with more than six tools collapses to one `- <server>__* — N tools …` line. <!-- id:fUDEa-rz -->
   - a one-line summary of top-level memory. <!-- id:MeTMOILl -->
   - a triggers line. It names active [triggers](./triggers.md) and advertises `read ~/triggers/` and `write ~/triggers/<name>` even when no triggers exist, so an agent asked "do this every morning" knows it can create the automation. <!-- id:M-5n-zT_ -->
@@ -294,7 +294,7 @@ A child always runs as the delegating agent. Direct agent-to-agent delegation (`
 
 **Leaves.** A run at the budget's depth is a leaf. It gets **no delegate verb at all** and no spawn handlers (`#delegationStatus`, `canDelegate`), and its system prompt says so ("You are a leaf worker…"). It never gets a verb whose every call is refused and costs a turn. <!-- id:44rasYwX -->
 
-Every non-leaf turn's prompt states its depth, how many children it may still start, and whether its children could delegate further. A parent whose children will be leaves is told to give them self-contained briefs (`delegationPrompt()`). A resolved child's `tool_result` also carries `delegation: {depth, maxDepth, childCouldDelegate, parentChildrenRemaining, parentMaxChildren}`. The parent's count there is the live one, since its system prompt was built when the run started. `~/self` shows the agent's preset and limits. <!-- id:Ok1umdMw -->
+Every non-leaf turn's prompt states its depth, how many children a run may start, and whether its children could delegate further. Once a run has started a child, a `<delegation_budget>` block with each turn's input says how many are left. A parent whose children will be leaves is told to give them self-contained briefs (`delegationPrompt()`). A resolved child's `tool_result` also carries `delegation: {depth, maxDepth, childCouldDelegate, parentChildrenRemaining, parentMaxChildren}`. The parent's count there is the live one; the system prompt itself carries no running count, so it stays the same across a park and resume. `~/self` shows the agent's preset and limits. <!-- id:Ok1umdMw -->
 
 When a run uses its last slot, `childrenExhaustedMessage()` tells it to finish alone now, and how to pack the next long list: several items per brief, or one script child whose children draw on their own budget. The one remaining fixed limit is 3 `return_result` retries (`MAX_RETURN_RESULT_RETRIES`). <!-- id:ENgm3Xcs -->
 
