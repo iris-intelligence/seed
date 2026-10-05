@@ -5020,9 +5020,14 @@ export class Service {
     // A steer joins the turn that is running instead of waiting for one of its own. The message is
     // in the log either way; if that turn can no longer take it in, the turn itself queues a run
     // for it when it ends, and if no turn is taking messages it is queued here like any other.
-    const steer =
+    const working =
       opts.whenBusy === 'steer' && queuedBehindAnotherTurn
-        ? this.#runningSessions.get(this.#runningSessionKey(accountId, sessionId))?.steer
+        ? this.#runningSessions.get(this.#runningSessionKey(accountId, sessionId))
+        : undefined
+    // Not a turn that is already on its way out: stopped, or past a call that ends it.
+    const steer =
+      working && !working.stopped && !working.parkToolCallIds?.length && !working.completeAfterTools
+        ? working.steer
         : undefined
     if (steer) {
       for (const event of userEvents) steer(event)
@@ -7699,9 +7704,27 @@ export class Service {
       resolveSettled = resolve
     })
     let turnSubmission: durable.Submission | undefined
-    // Messages handed to this turn while it ran (see `RunningSession.steer`), each with how its
-    // submission ended; undefined when the conversation never admitted it.
-    const steered: {eventId: string; settled: Promise<durable.SettledSubmissionRecord | undefined>}[] = []
+    // Messages handed to this turn while it ran (see `RunningSession.steer`).
+    const steered: {
+      eventId: string
+      /** The text the model reads, which is how a request is recognised as carrying the message. */
+      content: string
+      /** Absent when the conversation never admitted the message. */
+      submission: Promise<durable.Submission | undefined>
+      settled: Promise<durable.SettledSubmissionRecord | undefined>
+      /** Whether a provider request has carried the message to a model. */
+      read: boolean
+    }[] = []
+    const trackSteer = (eventId: string, content: string, submitting: Promise<durable.Submission | undefined>) => {
+      const submission = submitting.catch(() => undefined)
+      steered.push({
+        eventId,
+        content,
+        submission,
+        settled: submission.then((admitted) => admitted?.wait(durableSession.CONTEXT)).catch(() => undefined),
+        read: false,
+      })
+    }
     const onHarnessEvent = (event: durable.AgentEvent): void => {
       if (event.type === 'snapshot') {
         // The stream fell too far behind and was handed the current state instead of every step.
@@ -7885,6 +7908,14 @@ export class Service {
                   else signal.addEventListener('abort', () => reject(signal.reason), {once: true})
                 })
               }
+              // This request goes out, and with it every steered message the harness has placed.
+              // Being placed is not being read: a turn-ending call in the same round of tools
+              // places a steer and then ends the turn right above, before any model saw it.
+              for (const steer of steered) {
+                steer.read ||= request.messages.some(
+                  (message) => message.role === 'user' && message.content === steer.content,
+                )
+              }
               turnState ??= {index: request.messages.length, messages: turnStateMessages()}
               const messages = request.messages.map((message) => {
                 if (message.role !== 'toolResult') return message
@@ -7974,21 +8005,30 @@ export class Service {
         (record) => record.type === 'input' && record.requestId?.startsWith(durableSession.STEER_REQUEST_PREFIX),
       )
       // This run's own input, or, when that was already answered and the process died while the
-      // turn was answering a steer that came after it, the first of those steers.
+      // turn was answering a steer that came after it, that steer. Only one the harness had placed:
+      // a steer still queued behind a run that is gone would never be placed by waiting on it.
       const unsettled = run
         ? inspection.submissions.find(
             (record) => record.type === 'input' && record.requestId?.startsWith(`run:${run.id}:`),
-          ) ?? (sync?.input?.requestId.startsWith(`run:${run.id}:`) ? openSteers[0] : undefined)
+          ) ??
+          (sync?.input?.requestId.startsWith(`run:${run.id}:`)
+            ? openSteers.find((record) => record.status === 'placed')
+            : undefined)
         : undefined
       let submission = unsettled ? await harness.submission(unsettled.id, durableSession.CONTEXT) : undefined
       if (submission) {
         for (const record of openSteers) {
           if (record.id === unsettled?.id) continue
-          const open = await harness.submission(record.id, durableSession.CONTEXT)
-          steered.push({
-            eventId: (record.requestId ?? '').slice(durableSession.STEER_REQUEST_PREFIX.length),
-            settled: (open ? open.wait(durableSession.CONTEXT) : Promise.resolve(undefined)).catch(() => undefined),
-          })
+          const eventId = (record.requestId ?? '').slice(durableSession.STEER_REQUEST_PREFIX.length)
+          const row = stmt<SessionEventRow, [string, string]>(
+            this.#db,
+            `SELECT id, session_id, seq, event_cbor, created_at FROM session_events WHERE session_id = ? AND id = ?`,
+          ).get(sessionId, eventId)
+          trackSteer(
+            eventId,
+            (row ? userEventReplayMessage(sessionEventRowToInfo(row))?.content : undefined) ?? '',
+            harness.submission(record.id, durableSession.CONTEXT),
+          )
         }
         resumed = true
         turnLive = true
@@ -8044,41 +8084,57 @@ export class Service {
       }
       if (submission) {
         turnSubmission = submission
-        live.abort = () =>
-          conversation.abort(durableSession.CONTEXT).catch((error) => {
+        live.abort = () => {
+          // A turn that is being aborted takes no more messages in.
+          live.steer = undefined
+          return conversation.abort(durableSession.CONTEXT).catch((error) => {
             logRunError('aborting the durable turn failed', {
               error: error instanceof Error ? error.message : String(error),
             })
           })
+        }
         // From here until the turn is over, a message sent with `whenBusy: 'steer'` joins it. The
         // harness places it after the current round of tool calls, or, when the model was already
         // answering, lets it start one more run of the same turn.
         live.steer = (event) => {
           const message = userEventReplayMessage(event)
           if (!message) return
-          steered.push({
-            eventId: event.id,
-            settled: conversation
-              .submit(
-                {
-                  type: 'input',
-                  content: message.content,
-                  whenBusy: 'steer',
-                  requestId: `${durableSession.STEER_REQUEST_PREFIX}${event.id}`,
-                },
-                durableSession.CONTEXT,
-              )
-              .then((steer) => steer.wait(durableSession.CONTEXT))
-              .catch(() => undefined),
-          })
+          trackSteer(
+            event.id,
+            message.content,
+            conversation.submit(
+              {
+                type: 'input',
+                content: message.content,
+                whenBusy: 'steer',
+                requestId: `${durableSession.STEER_REQUEST_PREFIX}${event.id}`,
+              },
+              durableSession.CONTEXT,
+            ),
+          )
         }
         if (live.stopped) await live.abort()
-        settled = await submission.wait(durableSession.CONTEXT)
+        const own = await submission.wait(durableSession.CONTEXT)
+        settled = own
         // The turn lasts until every message it took in is settled too. The list can grow while
         // this waits; nothing is awaited between the last look at it and closing the door.
+        //
+        // The harness places a queued steer only at a boundary of a run that is going well. Once
+        // an input ends unanswered (the request failed, the turn was aborted) no such boundary
+        // comes, and a steer still queued would wait for ever. So from then on no new steer is
+        // taken, and each one still open is withdrawn. They get a run of their own below.
+        let ended = own.status !== 'done'
         for (let next = 0; next < steered.length; next += 1) {
-          const record = await steered[next]?.settled
+          const steer = steered[next]
+          if (!steer) continue
+          if (ended) {
+            live.steer = undefined
+            const open = await steer.submission
+            await open?.abort(durableSession.CONTEXT).catch(() => undefined)
+          }
+          const record = await steer.settled
           if (record?.status === 'done') settled = record
+          else ended = true
         }
         live.steer = undefined
         // Every entry of the turn is committed; wait for the stream to hand the last of them over.
@@ -8101,14 +8157,16 @@ export class Service {
       await harness.close(durableSession.CONTEXT).catch((error) => {
         logRunError('durable store close failed', {error: error instanceof Error ? error.message : String(error)})
       })
-      // A steered message the turn ended without taking in (it parked, moved to a new session, was
-      // stopped, or failed first) still has to be put to the model: it gets a turn of its own, as
-      // if it had been sent as a follow-up.
+      // A steered message that no request carried to a model (the turn parked, moved to a new
+      // session, or failed first) still has to be put to one: it gets a turn of its own, as if it
+      // had been sent as a follow-up. Not after a stop, though. Stop cancels the runs queued behind
+      // a turn, and a steer is the same wish in another form; it stays in the log for the next
+      // turn to read.
       const unread: string[] = []
       for (const steer of steered) {
-        if ((await steer.settled)?.entry === undefined) unread.push(steer.eventId)
+        if ((await steer.settled)?.status !== 'done' && !steer.read) unread.push(steer.eventId)
       }
-      if (unread.length > 0 && this.#getSessionInfo(accountId, sessionId)) {
+      if (unread.length > 0 && !live.stopped && this.#getSessionInfo(accountId, sessionId)) {
         logRun('steered messages left unread; queueing a turn for them', {messages: unread.length})
         this.#runQueue.enqueue({
           accountId,
@@ -8345,7 +8403,10 @@ export class Service {
       submitted.status === 'done' &&
       appended.length === 0 &&
       late.length === 0 &&
-      (appendable || sync.importedSeq === 0)
+      (appendable || sync.importedSeq === 0) &&
+      // The answer is still the last word: no steered message was placed behind it and then left
+      // unanswered by a request that failed.
+      (await conversation.context(durableSession.CONTEXT)).entries.at(-1)?.id === submitted.answer
     ) {
       // Nothing has reached the log since the newest input the conversation answered, so there is
       // nothing to ask the model. That input was this run's own (it was restarted between its
@@ -8425,19 +8486,57 @@ export class Service {
     }
 
     const replay = this.#piMessages(sessionId, left)
-    const queuedUserEventIds = runInput?.queuedBehindAnotherTurn === true ? [...runEventIds] : []
+    // Steered messages that were placed in the conversation and then left without an answer (the
+    // request that would have answered them failed, or the turn ended first) are in the same
+    // position as a message that queued up behind a turn: the log holds them ahead of an answer
+    // that is not theirs. Nothing the harness produced has been logged since they were placed.
+    const newestProjected =
+      stmt<{entry: number}, [string]>(
+        this.#db,
+        `SELECT COALESCE(MAX(pi_entry_id), 0) AS entry FROM session_events WHERE session_id = ?`,
+      ).get(sessionId)?.entry ?? 0
+    const recentUserEvents = stmt<SessionEventRow, [string]>(
+      this.#db,
+      `SELECT id, session_id, seq, event_cbor, created_at FROM session_events
+         WHERE session_id = ? ORDER BY seq DESC LIMIT 32`,
+    )
+      .all(sessionId)
+      .map(sessionEventRowToInfo)
+      .filter((event) => !left.has(event.id) && userEventReplayMessage(event) !== undefined)
+    const unansweredSteers = await conversation.commit(async (tx) => {
+      const ids: string[] = []
+      for (const event of recentUserEvents) {
+        const record = await tx.submissionByRequest(
+          conversation.id,
+          `${durableSession.STEER_REQUEST_PREFIX}${event.id}`,
+        )
+        if (
+          record?.type === 'input' &&
+          record.status === 'unanswered' &&
+          record.entry !== undefined &&
+          record.entry >= newestProjected
+        ) {
+          ids.push(event.id)
+        }
+      }
+      return ids
+    }, durableSession.CONTEXT)
+    const queuedUserEventIds = new Set([
+      ...(runInput?.queuedBehindAnotherTurn === true ? runEventIds : []),
+      ...unansweredSteers,
+    ])
     // A concurrent collaborator's message is appended immediately, even while the preceding
     // assistant response is still streaming. That means durable ordering can be user B, then the
     // tail of assistant A. A rebuilt context replays the log in that order, so it ends with a
     // handoff: the serialized follow-up turn cannot mistake A's later event for an answer to B.
     // The original messages remain the only copies in the log; this is provider guidance.
-    const concurrentMessages = queuedUserEventIds.length
+    const concurrentMessages = queuedUserEventIds.size
       ? stmt<SessionEventRow, [string]>(
           this.#db,
           `SELECT id, session_id, seq, event_cbor, created_at FROM session_events WHERE session_id = ? ORDER BY seq ASC`,
         )
           .all(sessionId)
-          .filter((row) => runEventIds.has(row.id))
+          .filter((row) => queuedUserEventIds.has(row.id))
           .map((row) => {
             const payload = cbor.decode<api.SessionEventPayload>(row.event_cbor) as {
               type?: string

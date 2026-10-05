@@ -79,7 +79,15 @@ A tool call is never cut short by a steer. Several steers waiting at one boundar
 
 When a steer is placed, its log event is marked with the entry it became, the same mark the harness's own entries carry, so no later import adds it again. The import also asks the store directly whether a message was placed, because a restart can come between the placement and the mark.
 
-A turn can end before it reads a steer: it parked on a child, moved to a successor session, was stopped, or failed. Pi Durable withdraws the steer, and Seed queues a run for it, exactly as if it had been sent as a follow-up. A turn that a restart cut off while it held steers picks them up again when the same run resumes.
+A turn can end before a model reads a steer: it parked on a child, moved to a successor session, or its request failed. Seed then queues a run for the steer, exactly as if it had been sent as a follow-up. What counts is whether a provider request carried the message, not whether the harness placed it: a call that ends the turn can share a round of tools with the steer, which is then placed and never sent.
+
+Three details follow from how Pi Durable treats its inbox.
+
+  - A queued steer is placed only at a boundary of a run that is going well. When a request fails, the inbox is left as it is. So once one of the turn's inputs ends unanswered, the turn takes no more steers and withdraws the ones still queued, and they get their run.
+  - A turn that is stopped, or has already made a call that ends it, takes no steers. A message sent to it then is queued like any other.
+  - Stop does not start work. A steer that Stop withdrew gets no run of its own, just as Stop cancels the runs queued behind a turn. It stays in the log and the next turn reads it.
+
+A turn that a restart cut off while it held steers picks them up again when the same run resumes. If the turn's own input was already answered and the restart came while it was answering a steer, the run resumes on that steer.
 
 # After a restart
 
@@ -98,7 +106,7 @@ A process that dies in the middle of a turn leaves the turn's input unsettled in
 # Open work
 
   - Steering is a server capability only. No client sends `whenBusy: 'steer'` yet, and a client has no way to show that a steered message has been read.
-  - A steer that was placed and then left unanswered by a turn that failed or was stopped stays in the conversation without a run of its own. The next turn reads it.
+  - A steer whose own request failed is answered by Retry, which rebuilds the context to do it. Appending would keep the provider's record.
   - A turn that is resumed after a restart knows which calls parked it, because their placeholders say so. It does not know that `continue_session` or `return_result` had already ended it, if the process died in the instant between that call and the end of the turn. The resumed turn then asks the model once more.
   - A rebuild writes the whole log into the store again. Rebuilds are rare (a retry, a restart repair), but a session that hits many of them grows its store with each one.
   - The store's main file grows with every commit and Pi Durable never compacts it. Thirty turns of streamed answers come to about 200 KB. The durable commit and the log write are still two separate writes, even though they now land in the same database. Putting both in one transaction would remove the reconciliation at open.

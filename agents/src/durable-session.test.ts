@@ -1136,7 +1136,7 @@ describe('steering', () => {
     expect(answers).toHaveLength(2)
   })
 
-  test('a steered message the turn ends without reading gets a turn of its own', async () => {
+  test('a steered message that Stop withdrew stays in the log for the next turn', async () => {
     let markStreaming = () => {}
     const streaming = new Promise<void>((resolve) => {
       markStreaming = resolve
@@ -1170,14 +1170,187 @@ describe('steering', () => {
     await turn.catch(() => {})
     await h.service.awaitQueueIdle()
 
-    // Stopping withdrew the steer before the model read it. It is answered all the same, once, by
-    // a run queued for it, which reads what had been said before the stop.
-    expect(requests).toHaveLength(2)
-    const second = (requests[1] ?? []).map((message) => String(message.content))
-    expect(second.filter((content) => content.includes('Never mind, summarize instead'))).toHaveLength(1)
-    expect(second).toContain('The long answer begins')
+    // Stop means stop: the steer the model never read does not start a turn of its own, any more
+    // than a queued follow-up would.
+    expect(requests).toHaveLength(1)
+    expect(h.db.query<{n: number}, []>(`SELECT COUNT(*) AS n FROM runs`).get()?.n).toBe(1)
+
+    // It is still in the log, and the next turn reads it, once, along with what had been said.
+    await h.send({_: 'MessageSession', sessionId: h.sessionId, content: [{type: 'text', text: 'Go on'}]})
+    const next = (requests[1] ?? []).map((message) => String(message.content))
+    expect(next.filter((content) => content.includes('Never mind, summarize instead'))).toHaveLength(1)
+    expect(next).toContain('The long answer begins')
+  })
+
+  test('a steer sent after Stop, while a tool is still finishing, does not hold the turn open', async () => {
+    const h = await createSession()
+    const requests: ChatMessage[][] = []
+    let releaseTool = () => {}
+    const toolGate = new Promise<void>((resolve) => {
+      releaseTool = resolve
+    })
+    let markToolStarted = () => {}
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve
+    })
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = url instanceof Request ? url.url : String(url)
+      if (href.includes('/api/Resource')) {
+        markToolStarted()
+        await toolGate
+        return notesDocumentResponse()
+      }
+      if (!href.includes('/chat/completions')) return Response.json(serialize({}))
+      requests.push(providerMessages(init))
+      return requests.length === 1
+        ? toolCallReply('chat-1', 'call-read', 'read', {address: 'hm://z6Mkdoc/notes'})
+        : textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+    }) as unknown as typeof fetch
+
+    const turn = h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'Read the notes'}],
+    })
+    await toolStarted
+    const stopping = h.send({_: 'StopSession', sessionId: h.sessionId})
+    // The turn is on its way out but its tool has not returned. It takes no more messages in, so
+    // this one is queued for a turn of its own like any message sent to a busy session.
+    await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'One more thing'}],
+      whenBusy: 'steer',
+    })
+    releaseTool()
+    await stopping
+    await turn.catch(() => {})
+    await h.service.awaitQueueIdle()
+
     const statuses = h.db.query<{status: string}, []>(`SELECT status FROM runs ORDER BY created_at ASC`).all()
     expect(statuses.map((row) => row.status)).toEqual(['canceled', 'succeeded'])
+    const last = (requests.at(-1) ?? []).map((message) => String(message.content))
+    expect(last.filter((content) => content.includes('One more thing'))).toHaveLength(1)
+  })
+
+  test('a steer waiting behind a request that fails gets a turn of its own, and the failure is reported', async () => {
+    let markStreaming = () => {}
+    const streaming = new Promise<void>((resolve) => {
+      markStreaming = resolve
+    })
+    const h = await createSession({
+      onEvent: (event) => {
+        if (event.type === 'session-partial' && event.textDelta) markStreaming()
+      },
+    })
+    const requests: ChatMessage[][] = []
+    let failFirst = () => {}
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(providerMessages(init))
+      if (requests.length > 1) return textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+      const first = {id: 'chat-1', choices: [{index: 0, delta: {role: 'assistant', content: 'The answer begins'}}]}
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(first)}\n\n`))
+          failFirst = () => controller.error(new Error('connection lost'))
+        },
+      })
+      return new Response(body, {headers: {'content-type': 'text/event-stream'}})
+    }) as unknown as typeof fetch
+
+    const turn = h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'First question'}],
+    })
+    await streaming
+    await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'And a second one'}],
+      whenBusy: 'steer',
+    })
+    failFirst()
+    // The harness leaves a queued steer alone when a run fails. The turn must not wait on it.
+    await expect(turn).rejects.toThrow()
+    await h.service.awaitQueueIdle()
+
+    const statuses = h.db.query<{status: string}, []>(`SELECT status FROM runs ORDER BY created_at ASC`).all()
+    expect(statuses.map((row) => row.status)).toEqual(['failed', 'succeeded'])
+    const last = (requests.at(-1) ?? []).map((message) => String(message.content))
+    expect(last.filter((content) => content.includes('And a second one'))).toHaveLength(1)
+  })
+
+  test('retrying after the request that answered a steer failed asks the model about the steer', async () => {
+    let markStreaming = () => {}
+    const streaming = new Promise<void>((resolve) => {
+      markStreaming = resolve
+    })
+    const h = await createSession({
+      onEvent: (event) => {
+        if (event.type === 'session-partial' && event.textDelta) markStreaming()
+      },
+    })
+    const requests: ChatMessage[][] = []
+    let finishFirst = () => {}
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(providerMessages(init))
+      if (requests.length === 2) return new Response('bad request', {status: 400})
+      if (requests.length > 2) return textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+      const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.enqueue(
+            encode({id: 'chat-1', choices: [{index: 0, delta: {role: 'assistant', content: 'Answer 1'}}]}),
+          )
+          finishFirst = () => {
+            controller.enqueue(
+              encode({
+                id: 'chat-1',
+                choices: [{index: 0, delta: {}, finish_reason: 'stop'}],
+                usage: {prompt_tokens: 7, completion_tokens: 3, total_tokens: 10},
+              }),
+            )
+            controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+            controller.close()
+          }
+        },
+      })
+      return new Response(body, {headers: {'content-type': 'text/event-stream'}})
+    }) as unknown as typeof fetch
+
+    const turn = h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'First question'}],
+    })
+    await streaming
+    await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'And a second one'}],
+      whenBusy: 'steer',
+    })
+    finishFirst()
+    await expect(turn).rejects.toThrow()
+    await h.service.awaitQueueIdle()
+    expect(requests).toHaveLength(2)
+
+    // The first question has its answer; the steer does not. A retry is about the steer.
+    const retried = await h.send({_: 'RetrySession', sessionId: h.sessionId})
+    expect(retried._).toBe('RetrySessionResponse')
+    expect(requests).toHaveLength(3)
+    const third = (requests[2] ?? []).map((message) => `${message.role}:${String(message.content)}`)
+    const asked = third.find((message) => message.startsWith('user:<concurrent_user_messages>'))
+    expect(asked).toContain('And a second one')
+    expect(third.indexOf(asked ?? '')).toBeGreaterThan(third.indexOf('assistant:Answer 1'))
+
+    // Once answered, the steer is not brought up again: the next turn appends, and the only
+    // handoff in its context is the one the retry was given.
+    await h.send({_: 'MessageSession', sessionId: h.sessionId, content: [{type: 'text', text: 'Thanks'}]})
+    const fourth = (requests[3] ?? []).map((message) => String(message.content))
+    expect(fourth.filter((content) => content.startsWith('<concurrent_user_messages>'))).toHaveLength(1)
+    expect(fourth.findIndex((content) => content.includes('Thanks'))).toBeGreaterThan(fourth.indexOf('Answer 3'))
   })
 
   test('a steer that finds no turn running is an ordinary message', async () => {
