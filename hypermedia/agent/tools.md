@@ -359,7 +359,7 @@ Tool failures should usually become `tool_result.error`, so the model can respon
 
 On later turns the model reads those same entries from the session's durable conversation. When the conversation has to be rebuilt from the log, the server replays assistant text and consecutive `tool_call` events as a single assistant message, placed before their matching `tool_result` messages. This keeps provider replay valid for APIs such as OpenAI chat completions, which reject orphaned `tool` messages and expect multi-tool batches grouped. <!-- id:TyneiaQU -->
 
-Parked `delegate` calls keep their durable `tool_call` unanswered on purpose, until the child's finalizer appends the real result. In the durable conversation the call holds a placeholder result until then. A post-park reconcile pass closes the race where a fast child finalizes before the parent's `waiting` status commits. <!-- id:9Dtuf-4o -->
+Parked `delegate` calls keep their durable `tool_call` unanswered on purpose, until the child's finalizer appends the real result. In the durable conversation the call holds a placeholder result until then, and the real result replaces it through a context edit. A post-park reconcile pass closes the race where a fast child finalizes before the parent's `waiting` status commits. <!-- id:9Dtuf-4o -->
 
 # Size limits <!-- id:TX-32IwL -->
 
