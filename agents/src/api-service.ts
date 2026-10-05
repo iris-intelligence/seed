@@ -9032,22 +9032,41 @@ export class Service {
       if (!occurrence) continue
       matched += 1
       const firingId = crypto.randomUUID()
-      const inserted = stmt(
-        this.#db,
-        `INSERT OR IGNORE INTO trigger_firings
-           (id, account_id, agent_id, trigger_id, activity_key, activity_cbor, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run([
-        firingId,
-        trigger.account,
-        trigger.agentId,
-        trigger.id,
-        occurrence.activityKey,
-        cbor.encode(occurrence.activity),
-        'created',
-        now,
-      ])
-      if (inserted.changes === 0) {
+      // The firing and the schedule's advance are one write. An occurrence that has a firing is
+      // spent, whatever comes of it: it woke a run, found nobody listening, or failed. Were the
+      // schedule left where it was in the last two cases, every later poll would compute this same
+      // occurrence, find its firing already recorded, and skip it. The schedule would never fire
+      // again. A 'once' schedule is disabled here for the same reason, and so that a slow run
+      // cannot let its one occurrence fire twice.
+      const once = trigger.source.schedule.kind === 'once'
+      const claimed = this.#db.transaction((): boolean => {
+        const inserted = stmt(
+          this.#db,
+          `INSERT OR IGNORE INTO trigger_firings
+             (id, account_id, agent_id, trigger_id, activity_key, activity_cbor, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run([
+          firingId,
+          trigger.account,
+          trigger.agentId,
+          trigger.id,
+          occurrence.activityKey,
+          cbor.encode(occurrence.activity),
+          'created',
+          now,
+        ])
+        if (inserted.changes === 0) return false
+        stmt(
+          this.#db,
+          `UPDATE agent_triggers SET last_fired_at = ?, last_error = NULL, enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
+        ).run(
+          // The caller's clock, not Date.now(): mixing the injected timestamp with the wall clock
+          // makes a firing in the same millisecond as trigger creation eligible to re-match.
+          [Math.max(now, occurrence.scheduledAt), once ? 1 : 0, trigger.account, trigger.id],
+        )
+        return true
+      })()
+      if (!claimed) {
         skipped += 1
         continue
       }
@@ -9074,21 +9093,6 @@ export class Service {
           ])
           this.#forgetSessionDerived(trigger.account, session.sessionId)
         }
-        // Disable a 'once' schedule at fire time (session created), not after the run, so a slow run
-        // can't let the same occurrence fire twice.
-        stmt(
-          this.#db,
-          `UPDATE agent_triggers SET last_fired_at = ?, last_error = NULL, enabled = CASE WHEN ? THEN 0 ELSE enabled END WHERE account_id = ? AND id = ?`,
-        ).run(
-          // The caller's clock, not Date.now(): mixing the injected timestamp with the wall clock
-          // makes a firing in the same millisecond as trigger creation eligible to re-match.
-          [
-            Math.max(now, occurrence.scheduledAt),
-            trigger.source.schedule.kind === 'once' ? 1 : 0,
-            trigger.account,
-            trigger.id,
-          ],
-        )
         fired += 1
         // Run the agent in the background; the session already exists for this occurrence.
         if (session) {
