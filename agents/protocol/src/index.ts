@@ -987,6 +987,13 @@ export type MessageSession = {
   sessionId: string
   content: MessageSessionContentPart[]
   clientMessageId?: string
+  /**
+   * What to do when the agent is already working in this session. `followUp` (the default) queues
+   * the message for a turn of its own after the current one. `steer` hands it to the turn that is
+   * running: the model reads it after its current round of tool calls and carries on with it in
+   * view. A steer that the turn ends without reading becomes a follow-up.
+   */
+  whenBusy?: 'steer' | 'followUp'
 }
 
 /**

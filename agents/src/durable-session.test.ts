@@ -1007,6 +1007,199 @@ describe('durable sessions', () => {
   })
 })
 
+describe('steering', () => {
+  const userMessages = (h: TestSession) =>
+    eventRows(h.db, h.sessionId).filter((row) => row.type === 'message' && row.role === 'user')
+
+  test('a message steered into a turn is read after its tool round, by that same turn', async () => {
+    const h = await createSession()
+    const requests: ChatMessage[][] = []
+    let releaseTool = () => {}
+    const toolGate = new Promise<void>((resolve) => {
+      releaseTool = resolve
+    })
+    let markToolStarted = () => {}
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve
+    })
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = url instanceof Request ? url.url : String(url)
+      if (href.includes('/api/Resource')) {
+        markToolStarted()
+        await toolGate
+        return notesDocumentResponse()
+      }
+      if (!href.includes('/chat/completions')) return Response.json(serialize({}))
+      requests.push(providerMessages(init))
+      return requests.length === 1
+        ? toolCallReply('chat-1', 'call-read', 'read', {address: 'hm://z6Mkdoc/notes'})
+        : textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+    }) as unknown as typeof fetch
+
+    const turn = h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'Read the notes'}],
+    })
+    await toolStarted
+    const steer = await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'Only the first line, please'}],
+      whenBusy: 'steer',
+    })
+    expect(steer).toMatchObject({_: 'MessageSessionResponse', assistantEventId: ''})
+    releaseTool()
+    await turn
+    await h.service.awaitQueueIdle()
+
+    // One turn, two requests: the model reads the steer right behind the result of the tool that
+    // was running when it arrived, and answers once.
+    expect(requests).toHaveLength(2)
+    const second = (requests[1] ?? []).map((message) => `${message.role}:${String(message.content)}`)
+    const resultAt = second.findIndex((message) => message.startsWith('tool:'))
+    expect(second[resultAt + 1]).toContain('Only the first line, please')
+    expect(h.db.query<{n: number}, []>(`SELECT COUNT(*) AS n FROM runs`).get()?.n).toBe(1)
+    // The log keeps the message where it was sent; the mark says the conversation holds it.
+    expect(userMessages(h).map((row) => row.entry === null)).toEqual([true, false])
+
+    // The next turn appends: the steered message is in the conversation once.
+    await h.send({_: 'MessageSession', sessionId: h.sessionId, content: [{type: 'text', text: 'Thanks'}]})
+    const third = (requests[2] ?? []).map((message) => String(message.content))
+    expect(third.filter((content) => content.includes('Only the first line, please'))).toHaveLength(1)
+    const entries = await durableEntries(h)
+    expect(entries.filter((entry) => durable.ResetEntry.is(entry))).toHaveLength(1)
+  })
+
+  test('a message steered into a turn that is already answering is answered next, by the same run', async () => {
+    let markStreaming = () => {}
+    const streaming = new Promise<void>((resolve) => {
+      markStreaming = resolve
+    })
+    const h = await createSession({
+      onEvent: (event) => {
+        if (event.type === 'session-partial' && event.textDelta) markStreaming()
+      },
+    })
+    const requests: ChatMessage[][] = []
+    let finishFirst = () => {}
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(providerMessages(init))
+      if (requests.length > 1) return textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+      const encode = (chunk: unknown) => new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.enqueue(
+            encode({id: 'chat-1', choices: [{index: 0, delta: {role: 'assistant', content: 'Answer 1'}}]}),
+          )
+          finishFirst = () => {
+            controller.enqueue(
+              encode({
+                id: 'chat-1',
+                choices: [{index: 0, delta: {}, finish_reason: 'stop'}],
+                usage: {prompt_tokens: 7, completion_tokens: 3, total_tokens: 10},
+              }),
+            )
+            controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+            controller.close()
+          }
+        },
+      })
+      return new Response(body, {headers: {'content-type': 'text/event-stream'}})
+    }) as unknown as typeof fetch
+
+    const turn = h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'First question'}],
+    })
+    await streaming
+    await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'And a second one'}],
+      whenBusy: 'steer',
+    })
+    finishFirst()
+    await turn
+    await h.service.awaitQueueIdle()
+
+    // No tool round was left to join, so the steer waited for the answer and then got its own,
+    // without a second run being queued for it.
+    expect(requests).toHaveLength(2)
+    const second = (requests[1] ?? []).map((message) => `${message.role}:${String(message.content)}`)
+    expect(second.findIndex((message) => message.includes('And a second one'))).toBeGreaterThan(
+      second.indexOf('assistant:Answer 1'),
+    )
+    expect(h.db.query<{n: number}, []>(`SELECT COUNT(*) AS n FROM runs`).get()?.n).toBe(1)
+    const answers = eventRows(h.db, h.sessionId).filter((row) => row.type === 'message' && row.role === 'assistant')
+    expect(answers).toHaveLength(2)
+  })
+
+  test('a steered message the turn ends without reading gets a turn of its own', async () => {
+    let markStreaming = () => {}
+    const streaming = new Promise<void>((resolve) => {
+      markStreaming = resolve
+    })
+    const h = await createSession({
+      onEvent: (event) => {
+        if (event.type === 'session-partial' && event.textDelta) markStreaming()
+      },
+    })
+    const requests: ChatMessage[][] = []
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(providerMessages(init))
+      if (requests.length > 1) return textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+      const first = {id: 'chat-1', choices: [{index: 0, delta: {role: 'assistant', content: 'The long answer begins'}}]}
+      // The response stays open until the turn is stopped.
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(first)}\n\n`)),
+      })
+      return new Response(body, {headers: {'content-type': 'text/event-stream'}})
+    }) as unknown as typeof fetch
+
+    const turn = h.send({_: 'MessageSession', sessionId: h.sessionId, content: [{type: 'text', text: 'Explain'}]})
+    await streaming
+    await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'Never mind, summarize instead'}],
+      whenBusy: 'steer',
+    })
+    await h.send({_: 'StopSession', sessionId: h.sessionId})
+    await turn.catch(() => {})
+    await h.service.awaitQueueIdle()
+
+    // Stopping withdrew the steer before the model read it. It is answered all the same, once, by
+    // a run queued for it, which reads what had been said before the stop.
+    expect(requests).toHaveLength(2)
+    const second = (requests[1] ?? []).map((message) => String(message.content))
+    expect(second.filter((content) => content.includes('Never mind, summarize instead'))).toHaveLength(1)
+    expect(second).toContain('The long answer begins')
+    const statuses = h.db.query<{status: string}, []>(`SELECT status FROM runs ORDER BY created_at ASC`).all()
+    expect(statuses.map((row) => row.status)).toEqual(['canceled', 'succeeded'])
+  })
+
+  test('a steer that finds no turn running is an ordinary message', async () => {
+    const h = await createSession()
+    const requests: ChatMessage[][] = []
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(providerMessages(init))
+      return textReply(`chat-${requests.length}`, `Answer ${requests.length}`)
+    }) as unknown as typeof fetch
+
+    const answered = await h.send({
+      _: 'MessageSession',
+      sessionId: h.sessionId,
+      content: [{type: 'text', text: 'Hello'}],
+      whenBusy: 'steer',
+    })
+    if (answered._ !== 'MessageSessionResponse') throw new Error('unexpected response')
+    expect(answered.assistantEventId).not.toBe('')
+    expect(requests).toHaveLength(1)
+  })
+})
+
 describe('StreamedTextTracker', () => {
   const partial = (...texts: string[]): piAi.AssistantMessage =>
     ({

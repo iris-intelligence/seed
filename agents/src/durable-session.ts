@@ -206,6 +206,12 @@ export const SyncDoc = durable.defineDoc<SyncState>({
   initial: () => ({importedSeq: 0}),
 })
 
+/**
+ * The request id a message handed to a running turn is submitted under: the prefix, then the id of
+ * its log event. It is how the log event and the conversation's copy of it are told to be one.
+ */
+export const STEER_REQUEST_PREFIX = 'steer:'
+
 /** A transcript entry written from the Seed log rather than produced by the harness. */
 export const ReplayEntry = durable.defineEntry('seed.replay')
 
@@ -240,6 +246,9 @@ export async function openSessionHarness(options: {
         // Retry policy belongs to the run queue: interactive turns fail fast, background runs ride
         // the queue's backoff. Only a single request's transient failures are retried in place.
         retry: {enabled: false},
+        // Messages handed to a running turn are read together: a person who sends three short
+        // messages in a row means them as one.
+        steeringMode: 'all',
         stream: {maxRetries: PROVIDER_REQUEST_MAX_RETRIES},
       },
     },

@@ -397,6 +397,11 @@ type SessionContinuationOutcome = {
 type RunningSession = {
   accountId: string
   abort?: () => Promise<void>
+  /**
+   * Hands a user message that is already in the log to the turn in flight. Present only while the
+   * turn can still take one in; a message that finds it absent is queued for a turn of its own.
+   */
+  steer?: (event: api.SessionEvent) => void
   stopped: boolean
   /** Sub-session tool calls of the current turn the run must park on (set by the sub_session executor). */
   parkToolCallIds?: string[]
@@ -1391,6 +1396,7 @@ export class Service {
           envelope.action.content,
           envelope.action.clientMessageId,
           {accountId: verified.accountId, signerId: verified.signerId},
+          envelope.action.whenBusy,
         )
       case 'UploadSessionAttachment':
         return this.#uploadSessionAttachment(
@@ -4864,7 +4870,11 @@ export class Service {
     content: api.MessageSession['content'],
     clientMessageId?: string,
     origin?: {accountId: string; signerId: string},
+    whenBusy?: api.MessageSession['whenBusy'],
   ): Promise<api.MessageSessionResponse> {
+    if (whenBusy !== undefined && whenBusy !== 'steer' && whenBusy !== 'followUp') {
+      throw new APIError(400, 'whenBusy must be "steer" or "followUp"')
+    }
     const normalizedId =
       clientMessageId === undefined
         ? undefined
@@ -4885,7 +4895,10 @@ export class Service {
       }
     }
 
-    const response = await this.#messageSessionOnce(accountId, sessionId, content, origin ? {userOrigin: origin} : {})
+    const response = await this.#messageSessionOnce(accountId, sessionId, content, {
+      ...(origin ? {userOrigin: origin} : {}),
+      ...(whenBusy ? {whenBusy} : {}),
+    })
     if (normalizedId !== undefined && requestCBOR !== undefined) {
       stmt(
         this.#db,
@@ -4918,6 +4931,8 @@ export class Service {
        * session's or agent's thoroughness decides (see #delegationBudgetForSession).
        */
       budget?: runs.RunBudget
+      /** What a message that finds the agent working asks for; see `api.MessageSession.whenBusy`. */
+      whenBusy?: api.MessageSession['whenBusy']
     } = {},
   ): Promise<api.MessageSessionResponse> {
     const messages = normalizeMessageContent(rawContent)
@@ -5002,6 +5017,17 @@ export class Service {
     // session, leave this run queued instead of rejecting the writer; the per-session run claim
     // serializes model work while every collaborator remains free to contribute to the shared log.
     const queuedBehindAnotherTurn = runs.sessionHasLiveRun(this.#db, sessionId)
+    // A steer joins the turn that is running instead of waiting for one of its own. The message is
+    // in the log either way; if that turn can no longer take it in, the turn itself queues a run
+    // for it when it ends, and if no turn is taking messages it is queued here like any other.
+    const steer =
+      opts.whenBusy === 'steer' && queuedBehindAnotherTurn
+        ? this.#runningSessions.get(this.#runningSessionKey(accountId, sessionId))?.steer
+        : undefined
+    if (steer) {
+      for (const event of userEvents) steer(event)
+      return {_: 'MessageSessionResponse', sessionId, assistantEventId: ''}
+    }
     const origin = opts.origin ?? 'user'
     const run = this.#runQueue.enqueue({
       id: opts.runId,
@@ -7673,6 +7699,9 @@ export class Service {
       resolveSettled = resolve
     })
     let turnSubmission: durable.Submission | undefined
+    // Messages handed to this turn while it ran (see `RunningSession.steer`), each with how its
+    // submission ended; undefined when the conversation never admitted it.
+    const steered: {eventId: string; settled: Promise<durable.SettledSubmissionRecord | undefined>}[] = []
     const onHarnessEvent = (event: durable.AgentEvent): void => {
       if (event.type === 'snapshot') {
         // The stream fell too far behind and was handed the current state instead of every step.
@@ -7759,8 +7788,24 @@ export class Service {
         logRunError('durable task failed', {kind: event.kind, error: event.message})
         return
       }
-      if (event.type === 'submission' && event.record.id === turnSubmission?.id) {
-        if (event.record.status === 'done' || event.record.status === 'unanswered') resolveSettled()
+      if (event.type === 'submission') {
+        const record = event.record
+        if (
+          record.type === 'input' &&
+          record.entry !== undefined &&
+          record.requestId?.startsWith(durableSession.STEER_REQUEST_PREFIX)
+        ) {
+          // A steered message is now part of the transcript the model reads. Its log event has been
+          // there since it was sent; marking it with the entry keeps the next import from adding it
+          // a second time.
+          stmt(
+            this.#db,
+            `UPDATE session_events SET pi_entry_id = ? WHERE session_id = ? AND id = ? AND pi_entry_id IS NULL`,
+          ).run([record.entry, sessionId, record.requestId.slice(durableSession.STEER_REQUEST_PREFIX.length)])
+        }
+        if (record.id === turnSubmission?.id && (record.status === 'done' || record.status === 'unanswered')) {
+          resolveSettled()
+        }
       }
     }
 
@@ -7924,13 +7969,27 @@ export class Service {
       // run adopts it: finished tool calls are not repeated, replay-safe ones rerun, and anything
       // else that was cut off reaches the model as an interrupted result.
       const inspection = await harness.inspect(durableSession.CONTEXT)
+      // Messages that were handed to the turn the store last ran, and are still open in it.
+      const openSteers = inspection.submissions.filter(
+        (record) => record.type === 'input' && record.requestId?.startsWith(durableSession.STEER_REQUEST_PREFIX),
+      )
+      // This run's own input, or, when that was already answered and the process died while the
+      // turn was answering a steer that came after it, the first of those steers.
       const unsettled = run
         ? inspection.submissions.find(
             (record) => record.type === 'input' && record.requestId?.startsWith(`run:${run.id}:`),
-          )
+          ) ?? (sync?.input?.requestId.startsWith(`run:${run.id}:`) ? openSteers[0] : undefined)
         : undefined
       let submission = unsettled ? await harness.submission(unsettled.id, durableSession.CONTEXT) : undefined
       if (submission) {
+        for (const record of openSteers) {
+          if (record.id === unsettled?.id) continue
+          const open = await harness.submission(record.id, durableSession.CONTEXT)
+          steered.push({
+            eventId: (record.requestId ?? '').slice(durableSession.STEER_REQUEST_PREFIX.length),
+            settled: (open ? open.wait(durableSession.CONTEXT) : Promise.resolve(undefined)).catch(() => undefined),
+          })
+        }
         resumed = true
         turnLive = true
         logRun('resuming the durable turn an earlier process left unfinished', {submissionId: submission.id})
@@ -7991,8 +8050,37 @@ export class Service {
               error: error instanceof Error ? error.message : String(error),
             })
           })
+        // From here until the turn is over, a message sent with `whenBusy: 'steer'` joins it. The
+        // harness places it after the current round of tool calls, or, when the model was already
+        // answering, lets it start one more run of the same turn.
+        live.steer = (event) => {
+          const message = userEventReplayMessage(event)
+          if (!message) return
+          steered.push({
+            eventId: event.id,
+            settled: conversation
+              .submit(
+                {
+                  type: 'input',
+                  content: message.content,
+                  whenBusy: 'steer',
+                  requestId: `${durableSession.STEER_REQUEST_PREFIX}${event.id}`,
+                },
+                durableSession.CONTEXT,
+              )
+              .then((steer) => steer.wait(durableSession.CONTEXT))
+              .catch(() => undefined),
+          })
+        }
         if (live.stopped) await live.abort()
         settled = await submission.wait(durableSession.CONTEXT)
+        // The turn lasts until every message it took in is settled too. The list can grow while
+        // this waits; nothing is awaited between the last look at it and closing the door.
+        for (let next = 0; next < steered.length; next += 1) {
+          const record = await steered[next]?.settled
+          if (record?.status === 'done') settled = record
+        }
+        live.steer = undefined
         // Every entry of the turn is committed; wait for the stream to hand the last of them over.
         await Promise.race([settledSeen, stream.closed])
       }
@@ -8007,11 +8095,35 @@ export class Service {
     } finally {
       endStreamingLog()
       live.abort = undefined
+      live.steer = undefined
       this.#runningSessions.delete(runningSessionKey)
       // Closing leaves unfinished work pending in the store; it never cancels it.
       await harness.close(durableSession.CONTEXT).catch((error) => {
         logRunError('durable store close failed', {error: error instanceof Error ? error.message : String(error)})
       })
+      // A steered message the turn ended without taking in (it parked, moved to a new session, was
+      // stopped, or failed first) still has to be put to the model: it gets a turn of its own, as
+      // if it had been sent as a follow-up.
+      const unread: string[] = []
+      for (const steer of steered) {
+        if ((await steer.settled)?.entry === undefined) unread.push(steer.eventId)
+      }
+      if (unread.length > 0 && this.#getSessionInfo(accountId, sessionId)) {
+        logRun('steered messages left unread; queueing a turn for them', {messages: unread.length})
+        this.#runQueue.enqueue({
+          accountId,
+          kind: 'agent',
+          origin: 'user',
+          agentId: session.agentId,
+          sessionId,
+          title: 'Respond to a message sent during the previous turn',
+          input: {kind: 'session-message', userEventIds: unread, queuedBehindAnotherTurn: true},
+          queue: 'interactive',
+          budget: this.#delegationBudgetForSession(accountId, session.agentId, sessionId),
+          maxAttempts: 1,
+          dispatch: true,
+        })
+      }
       await mcpPool.close()
       if (run && runUsage.total > 0) this.#runQueue.updateUsage(run.id, {...runUsage})
       logRun('agent run finished', {
@@ -8149,8 +8261,30 @@ export class Service {
         )
         .map((event) => event.id),
     )
-    const pending = unimported.filter((event) => !left.has(event.id))
     const leftSeqs = unimported.filter((event) => left.has(event.id)).map((event) => event.seq)
+    // A message that was handed to a running turn (a steer) may already be in the transcript,
+    // under the entry the harness gave it, without its log event having been marked yet: the mark
+    // is written as the turn runs and a restart can come between the two. Its submission says so.
+    const steeredInto = await conversation.commit(async (tx) => {
+      const entries = new Map<string, number>()
+      for (const event of unimported) {
+        if (left.has(event.id) || userEventReplayMessage(event) === undefined) continue
+        const record = await tx.submissionByRequest(
+          conversation.id,
+          `${durableSession.STEER_REQUEST_PREFIX}${event.id}`,
+        )
+        if (record?.type === 'input' && record.entry !== undefined) entries.set(event.id, record.entry)
+      }
+      return entries
+    }, durableSession.CONTEXT)
+    for (const [eventId, entry] of steeredInto) {
+      stmt(this.#db, `UPDATE session_events SET pi_entry_id = ? WHERE session_id = ? AND id = ?`).run([
+        entry,
+        sessionId,
+        eventId,
+      ])
+    }
+    const pending = unimported.filter((event) => !left.has(event.id) && !steeredInto.has(event.id))
     // Strict JSON, as durable state requires: no undefined, nothing but plain data.
     const entryOf = (message: unknown): {model: piAi.Message[]} => ({model: [JSON.parse(JSON.stringify(message))]})
     const newInput = (content: string, eventId: string | undefined): durableSession.TurnInput => ({
@@ -8265,16 +8399,20 @@ export class Service {
         })
       }
     }
-    const newest = appended.at(-1)
-    const newestUser =
-      newest?.message.role === 'user' && typeof newest.message.content === 'string' ? newest : undefined
+    // The newest thing a person said is the input. Text of Seed's own that the log holds after it
+    // (what the agent had said when it was stopped) was said before the model reads that input,
+    // so it goes in ahead of it.
+    const inputAt = appended.findLastIndex(
+      (entry) => entry.message.role === 'user' && typeof entry.message.content === 'string',
+    )
+    const newestUser = inputAt >= 0 ? appended[inputAt] : undefined
     if (appendable && (newestUser !== undefined || edits.length > 0)) {
       // Children finished and nobody said anything new: hand the model back the floor explicitly.
       const input = newestUser
         ? newInput(String(newestUser.message.content), newestUser.eventId)
         : newInput(BACKGROUND_WORK_UPDATE_INPUT, undefined)
       await conversation.commit(async (tx) => {
-        for (const {message} of newestUser ? appended.slice(0, -1) : appended) {
+        for (const {message} of appended.filter((_, index) => index !== inputAt)) {
           await tx.appendEntry(durableSession.ReplayEntry, conversation.id, entryOf(message))
         }
         if (edits.length > 0) await tx.appendEntry(durableSession.ReplayEntry, conversation.id, {edits})

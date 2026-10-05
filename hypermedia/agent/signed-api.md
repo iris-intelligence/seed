@@ -708,8 +708,11 @@ Request: <!-- id:05bA7uU0 -->
     | {type: 'attachment'; id: string}
   >
   clientMessageId?: string
+  whenBusy?: 'steer' | 'followUp'
 }
 ```
+
+`whenBusy` says what to do when the agent is already working in the session. `followUp`, the default, queues the message for a turn of its own (steps 3 and 4 below). `steer` hands it to the turn that is running: no run is queued, the model reads the message after its current round of tool calls, and the response returns at once with an empty `assistantEventId`. A steer sent to a session with no running turn is an ordinary message. See [durable sessions](./durable-sessions.md) for what happens to a steer the turn ends without reading.
 
 `context` parts carry ambient client state. The desktop sidebar sends the current window (open [document](../protocol/documents.md), view, focused [block](../protocol/blocks.md)) so "this document" resolves for the model. All context lines in a request collapse onto its first user message as `contextLines`. They reach the model appended to that message inside a `<window_context>` block, and never appear in the transcript `content`. At least one `text` part is required. <!-- id:ANF-JVop -->
 

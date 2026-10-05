@@ -68,6 +68,19 @@ A parked `delegate` call is answered in the store with a placeholder that says t
 
 `StopSession` aborts the conversation the same way. Text that was already streamed stays in the log as an assistant message. The harness leaves a response that was cut off out of the model's context, so that message is imported with the next turn like any other, and the model knows what it had said.
 
+# Messages sent while a turn runs
+
+A message sent to a session whose agent is working is written to the log at once. What happens next is the sender's choice, in `MessageSession.whenBusy`.
+
+  - **Follow-up**, the default. A run is queued for the message behind the one that is working. The import leaves the message for that run, so the model reads it once, in a turn of its own.
+  - **Steer.** No run is queued. The message is submitted to the running turn's conversation, and Pi Durable places it after the current round of tool calls, where the model reads it and carries on. A steer that arrives when the model is already writing its answer has no tool round to join: it is placed when that answer is done, and the same turn then answers it too.
+
+A tool call is never cut short by a steer. Several steers waiting at one boundary are placed together.
+
+When a steer is placed, its log event is marked with the entry it became, the same mark the harness's own entries carry, so no later import adds it again. The import also asks the store directly whether a message was placed, because a restart can come between the placement and the mark.
+
+A turn can end before it reads a steer: it parked on a child, moved to a successor session, was stopped, or failed. Pi Durable withdraws the steer, and Seed queues a run for it, exactly as if it had been sent as a follow-up. A turn that a restart cut off while it held steers picks them up again when the same run resumes.
+
 # After a restart
 
 A process that dies in the middle of a turn leaves the turn's input unsettled in the store and its run `running` in the database. The boot sweep requeues the run, as described under [runs](./runs.md). What happens next depends on who opens the store.
@@ -84,7 +97,8 @@ A process that dies in the middle of a turn leaves the turn's input unsettled in
 
 # Open work
 
-  - A message sent while a turn runs waits for the next turn. Pi Durable can hand it to the running turn at the next tool boundary.
+  - Steering is a server capability only. No client sends `whenBusy: 'steer'` yet, and a client has no way to show that a steered message has been read.
+  - A steer that was placed and then left unanswered by a turn that failed or was stopped stays in the conversation without a run of its own. The next turn reads it.
   - A turn that is resumed after a restart knows which calls parked it, because their placeholders say so. It does not know that `continue_session` or `return_result` had already ended it, if the process died in the instant between that call and the end of the turn. The resumed turn then asks the model once more.
   - A rebuild writes the whole log into the store again. Rebuilds are rare (a retry, a restart repair), but a session that hits many of them grows its store with each one.
   - The store's main file grows with every commit and Pi Durable never compacts it. Thirty turns of streamed answers come to about 200 KB. The durable commit and the log write are still two separate writes, even though they now land in the same database. Putting both in one transaction would remove the reconciliation at open.

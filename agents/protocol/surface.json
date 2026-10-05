@@ -328,7 +328,8 @@
         "_": "\"MessageSession\"",
         "clientMessageId?": "string",
         "content": "MessageSessionContentPart[]",
-        "sessionId": "string"
+        "sessionId": "string",
+        "whenBusy?": "\"followUp\" | \"steer\""
       }
     },
     "ReadAgentMemoryFile": {
